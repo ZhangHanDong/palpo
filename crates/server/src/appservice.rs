@@ -78,7 +78,6 @@ impl TryFrom<Vec<Namespace>> for NamespaceRegex {
     type Error = regex::Error;
 }
 
-
 /// Rewrite a registration namespace pattern so it must match the entire
 /// identifier.
 ///
@@ -443,9 +442,12 @@ mod tests {
     fn namespace_regex_rejects_an_invalid_pattern_with_its_original_diagnostic() {
         // Pasting `^(?:...)$` around this text would have turned it into the
         // VALID pattern `^(?:a)|(b)$` — and one that is not anchored at all.
-        let err = NamespaceRegex::try_from(vec![Namespace::new(true, "a)|(b".to_owned())])
+        // Built at runtime so clippy's `invalid_regex` lint does not reject the
+        // literal: the point of this test is that it must NOT compile.
+        let unbalanced = ["a)", "|(b"].concat();
+        let err = NamespaceRegex::try_from(vec![Namespace::new(true, unbalanced.clone())])
             .expect_err("an unbalanced pattern must not compile");
-        let original = regex::Regex::new("a)|(b").unwrap_err();
+        let original = regex::Regex::new(&unbalanced).unwrap_err();
         assert_eq!(err.to_string(), original.to_string());
     }
 
