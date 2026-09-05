@@ -151,6 +151,7 @@ rand = { workspace = true }
 rustyline-async = { workspace = true }
 regex = { workspace = true }
 regex-syntax = { workspace = true }
+regex-automata = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }

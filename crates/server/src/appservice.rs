@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use regex::RegexSet;
+use regex_automata::meta::Regex as MetaRegex;
 use subtle::ConstantTimeEq;
 
 use crate::core::appservice::{Namespace, Registration};
@@ -10,10 +10,14 @@ pub use crate::data::appservice::DbRegistration;
 use crate::{AppError, AppResult, data, sending};
 
 /// Compiled regular expressions for a namespace.
+///
+/// Each pattern is anchored to the whole identifier (see [`anchored_namespace_hir`])
+/// and the set is compiled straight from the HIR, so the source text is never
+/// rewritten and re-parsed.
 #[derive(Clone, Debug)]
 pub struct NamespaceRegex {
-    pub exclusive: Option<RegexSet>,
-    pub non_exclusive: Option<RegexSet>,
+    pub exclusive: Option<MetaRegex>,
+    pub non_exclusive: Option<MetaRegex>,
 }
 
 impl NamespaceRegex {
@@ -42,6 +46,16 @@ impl NamespaceRegex {
     }
 }
 
+fn compile_set(hirs: Vec<regex_syntax::hir::Hir>) -> Result<Option<MetaRegex>, regex::Error> {
+    if hirs.is_empty() {
+        return Ok(None);
+    }
+    MetaRegex::builder()
+        .build_many_from_hir(&hirs)
+        .map(Some)
+        .map_err(|e| regex::Error::Syntax(e.to_string()))
+}
+
 impl TryFrom<Vec<Namespace>> for NamespaceRegex {
     fn try_from(value: Vec<Namespace>) -> Result<Self, regex::Error> {
         let mut exclusive = vec![];
@@ -49,11 +63,10 @@ impl TryFrom<Vec<Namespace>> for NamespaceRegex {
 
         for namespace in value {
             // A namespace pattern claims an identifier only when it matches the
-            // WHOLE identifier. `RegexSet::is_match` is a substring search, so
-            // `@ac_.*` would also claim `prefix@ac_...` and a rooms pattern
-            // `!abc:example.org` would claim `!abc:example.org.evil`. Anchor
-            // every pattern semantically (see `anchor_namespace_regex`).
-            let anchored = anchor_namespace_regex(&namespace.regex)?;
+            // WHOLE identifier. A plain regex search would let `@ac_.*` claim
+            // `prefix@ac_...` and a rooms pattern `!abc:example.org` claim
+            // `!abc:example.org.evil`. Anchor every pattern in the HIR.
+            let anchored = anchored_namespace_hir(&namespace.regex)?;
             if namespace.exclusive {
                 exclusive.push(anchored);
             } else {
@@ -62,45 +75,35 @@ impl TryFrom<Vec<Namespace>> for NamespaceRegex {
         }
 
         Ok(NamespaceRegex {
-            exclusive: if exclusive.is_empty() {
-                None
-            } else {
-                Some(RegexSet::new(exclusive)?)
-            },
-            non_exclusive: if non_exclusive.is_empty() {
-                None
-            } else {
-                Some(RegexSet::new(non_exclusive)?)
-            },
+            exclusive: compile_set(exclusive)?,
+            non_exclusive: compile_set(non_exclusive)?,
         })
     }
-
     type Error = regex::Error;
 }
 
-/// Rewrite a registration namespace pattern so it must match the entire
-/// identifier.
+/// Parse a registration namespace pattern and anchor it to the whole
+/// identifier, in the regex HIR.
 ///
 /// The pattern is compiled on its own first, so an invalid pattern fails with
 /// exactly the diagnostic the original text produces. It is then parsed into
-/// `regex-syntax`'s HIR and wrapped in start/end-of-text assertions there,
-/// rather than by pasting `^(?:...)$` around the source text: textual wrapping
-/// changes what parses (an unbalanced `a)|(b` would become valid, and a
-/// verbose-mode pattern ending in a `# comment` would swallow the closing
-/// group). Patterns that already carry anchors stay equivalent.
-pub fn anchor_namespace_regex(pattern: &str) -> Result<String, regex::Error> {
-    // Original diagnostics first: `Regex::new` and the HIR parser agree on
-    // validity, and this is the error a registration author expects to see.
+/// `regex-syntax`'s HIR and wrapped in start/end-of-text assertions there. The
+/// anchored HIR is compiled directly (never printed back to text): pasting
+/// `^(?:...)$` around the source changes what parses, and the HIR printer does
+/// not preserve grouping for nested repetitions (`(?:[0-9]{2})?` would come
+/// back as `[0-9]{2}?`). Patterns that already carry anchors stay equivalent.
+pub fn anchored_namespace_hir(pattern: &str) -> Result<regex_syntax::hir::Hir, regex::Error> {
+    // Original diagnostics first: this is the error a registration author
+    // expects to see for an invalid pattern.
     regex::Regex::new(pattern)?;
     let hir = regex_syntax::Parser::new()
         .parse(pattern)
         .map_err(|e| regex::Error::Syntax(e.to_string()))?;
-    let anchored = regex_syntax::hir::Hir::concat(vec![
+    Ok(regex_syntax::hir::Hir::concat(vec![
         regex_syntax::hir::Hir::look(regex_syntax::hir::Look::Start),
         hir,
         regex_syntax::hir::Hir::look(regex_syntax::hir::Look::End),
-    ]);
-    Ok(anchored.to_string())
+    ]))
 }
 
 /// Appservice registration combined with its compiled regular expressions.
@@ -387,7 +390,7 @@ mod tests {
         assert!(!redacted.contains("secret"));
     }
 
-    use super::{NamespaceRegex, anchor_namespace_regex};
+    use super::{NamespaceRegex, anchored_namespace_hir};
     use crate::core::appservice::Namespace;
 
     fn users(exclusive: bool, pattern: &str) -> NamespaceRegex {
@@ -458,6 +461,38 @@ mod tests {
         let ns = users(true, "(?x)^@ac_alice:example\\.org$ # exact user");
         assert!(ns.is_match("@ac_alice:example.org"));
         assert!(!ns.is_match("@ac_alice:example.org.evil"));
-        assert!(anchor_namespace_regex("(?x)a # c").is_ok());
+        assert!(anchored_namespace_hir("(?x)a # c").is_ok());
+    }
+    #[test]
+    fn optional_repeated_suffix_must_remain_optional() {
+        // regex-syntax 0.8's HIR printer renders `(?:[0-9]{2})?` as `[0-9]{2}?`,
+        // which silently requires the two digits. Compiling straight from the
+        // HIR keeps the group optional.
+        let ns = users(true, "^@bot(?:[0-9]{2})?:example\\.org$");
+        assert!(ns.is_match("@bot:example.org"));
+        assert!(ns.is_match("@bot12:example.org"));
+        assert!(!ns.is_match("@bot1:example.org"));
+        assert!(!ns.is_match("@bot123:example.org"));
+        let ns = users(true, "^@bot(?:a+)?:example\\.org$");
+        assert!(ns.is_match("@bot:example.org"));
+        assert!(ns.is_match("@botaaa:example.org"));
+    }
+
+    #[test]
+    fn anchoring_does_not_add_parser_nesting() {
+        // 249 nested groups compile as a plain regex; anchoring in the HIR must
+        // not push the compiled set over the parser's nesting limit.
+        let deep = format!("^@{}a{}:x$", "(".repeat(249), ")".repeat(249));
+        let ns = users(true, &deep);
+        assert!(ns.is_match("@a:x"));
+        assert!(!ns.is_match("@a:xy"));
+    }
+
+    #[test]
+    fn anchors_are_text_boundaries_not_line_boundaries() {
+        let ns = users(true, "(?m)@ac_.*");
+        assert!(ns.is_match("@ac_alice:example.org"));
+        assert!(!ns.is_match("@ac_alice:example.org\n"));
+        assert!(!ns.is_match("x\n@ac_alice:example.org"));
     }
 }
