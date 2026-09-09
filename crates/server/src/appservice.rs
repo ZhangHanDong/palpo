@@ -11,9 +11,9 @@ use crate::{AppError, AppResult, data, sending};
 
 /// Compiled regular expressions for a namespace.
 ///
-/// Each pattern is anchored to the whole identifier (see [`anchored_namespace_hir`])
-/// and the set is compiled straight from the HIR, so the source text is never
-/// rewritten and re-parsed.
+/// Each pattern is anchored to the start of the identifier, preserving prefix
+/// matches like Synapse. The set is compiled straight from the HIR, so the
+/// source text is never rewritten and re-parsed.
 #[derive(Clone, Debug)]
 pub struct NamespaceRegex {
     pub exclusive: Option<MetaRegex>,
@@ -53,7 +53,10 @@ fn compile_set(hirs: Vec<regex_syntax::hir::Hir>) -> Result<Option<MetaRegex>, r
     MetaRegex::builder()
         .build_many_from_hir(&hirs)
         .map(Some)
-        .map_err(|e| regex::Error::Syntax(e.to_string()))
+        .map_err(|e| match e.size_limit() {
+            Some(limit) => regex::Error::CompiledTooBig(limit),
+            None => regex::Error::Syntax(e.to_string()),
+        })
 }
 
 impl TryFrom<Vec<Namespace>> for NamespaceRegex {
@@ -62,10 +65,10 @@ impl TryFrom<Vec<Namespace>> for NamespaceRegex {
         let mut non_exclusive = vec![];
 
         for namespace in value {
-            // A namespace pattern claims an identifier only when it matches the
-            // WHOLE identifier. A plain regex search would let `@ac_.*` claim
-            // `prefix@ac_...` and a rooms pattern `!abc:example.org` claim
-            // `!abc:example.org.evil`. Anchor every pattern in the HIR.
+            // Match from the start, like Synapse's regex.match, rather than
+            // letting `@ac_.*` claim `prefix@ac_...`. Prefix patterns such as
+            // `@irc_` and empty match-all patterns must keep working; an end
+            // anchor is the registration author's explicit choice.
             let anchored = anchored_namespace_hir(&namespace.regex)?;
             if namespace.exclusive {
                 exclusive.push(anchored);
@@ -82,27 +85,22 @@ impl TryFrom<Vec<Namespace>> for NamespaceRegex {
     type Error = regex::Error;
 }
 
-/// Parse a registration namespace pattern and anchor it to the whole
-/// identifier, in the regex HIR.
+/// Parse a registration namespace pattern and anchor it to the start of the
+/// identifier in the regex HIR.
 ///
-/// The pattern is compiled on its own first, so an invalid pattern fails with
-/// exactly the diagnostic the original text produces. It is then parsed into
-/// `regex-syntax`'s HIR and wrapped in start/end-of-text assertions there. The
-/// anchored HIR is compiled directly (never printed back to text): pasting
-/// `^(?:...)$` around the source changes what parses, and the HIR printer does
-/// not preserve grouping for nested repetitions (`(?:[0-9]{2})?` would come
-/// back as `[0-9]{2}?`). Patterns that already carry anchors stay equivalent.
-pub fn anchored_namespace_hir(pattern: &str) -> Result<regex_syntax::hir::Hir, regex::Error> {
-    // Original diagnostics first: this is the error a registration author
-    // expects to see for an invalid pattern.
-    regex::Regex::new(pattern)?;
+/// Parsing preserves the original syntax diagnostic without compiling the
+/// pattern twice. The anchored HIR is compiled directly (never printed back to
+/// text): pasting `^(?:...)` around the source changes what parses, and the HIR
+/// printer does not preserve grouping for nested repetitions (`(?:[0-9]{2})?`
+/// would come back as `[0-9]{2}?`). Existing end anchors are preserved, while
+/// the added start-of-text assertion is unaffected by multiline mode.
+fn anchored_namespace_hir(pattern: &str) -> Result<regex_syntax::hir::Hir, regex::Error> {
     let hir = regex_syntax::Parser::new()
         .parse(pattern)
         .map_err(|e| regex::Error::Syntax(e.to_string()))?;
     Ok(regex_syntax::hir::Hir::concat(vec![
         regex_syntax::hir::Hir::look(regex_syntax::hir::Look::Start),
         hir,
-        regex_syntax::hir::Hir::look(regex_syntax::hir::Look::End),
     ]))
 }
 
@@ -398,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_regex_matches_the_whole_identifier_not_a_substring() {
+    fn namespace_regex_matches_from_the_start_not_a_substring() {
         // `RegexSet::is_match` is a substring search: without anchoring
         // `@ac_.*` also claimed `prefix@ac_alice:example.org`.
         let ns = users(true, "@ac_.*");
@@ -410,8 +408,8 @@ mod tests {
     }
 
     #[test]
-    fn namespace_regex_room_pattern_does_not_claim_a_longer_server_name() {
-        let ns = users(false, "!abc:example.org");
+    fn namespace_regex_explicit_end_anchor_rejects_a_longer_server_name() {
+        let ns = users(false, "!abc:example\\.org$");
         assert!(ns.is_match("!abc:example.org"));
         assert!(!ns.is_match("!abc:example.org.evil"));
         assert!(!ns.is_exclusive_match("!abc:example.org"));
@@ -437,8 +435,97 @@ mod tests {
         let ns = users(true, "@a:x|@b:x");
         assert!(ns.is_match("@a:x"));
         assert!(ns.is_match("@b:x"));
-        assert!(!ns.is_match("@a:xy"));
+        assert!(ns.is_match("@a:xy"));
+        assert!(ns.is_match("@b:xy"));
+        assert!(!ns.is_match("y@a:x"));
         assert!(!ns.is_match("y@b:x"));
+    }
+
+    #[test]
+    fn namespace_regex_preserves_prefix_patterns() {
+        for exclusive in [true, false] {
+            for (pattern, identifier) in [
+                ("@irc_", "@irc_alice:example.org"),
+                ("#irc_", "#irc_room:example.org"),
+                ("!abc:example\\.org", "!abc:example.org.evil"),
+            ] {
+                let ns = users(exclusive, pattern);
+                assert!(ns.is_match(identifier), "prefix pattern: {pattern}");
+                assert_eq!(ns.is_exclusive_match(identifier), exclusive);
+                assert!(!ns.is_match(&format!("prefix{identifier}")));
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_regex_preserves_empty_match_all_patterns() {
+        for exclusive in [true, false] {
+            let ns = users(exclusive, "");
+            for identifier in [
+                "",
+                "@alice:example.org",
+                "#room:example.org",
+                "!room:example.org",
+            ] {
+                assert!(ns.is_match(identifier));
+                assert_eq!(ns.is_exclusive_match(identifier), exclusive);
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_regex_preserves_prefixes_in_mixed_namespace_sets() {
+        let ns = NamespaceRegex::try_from(vec![
+            Namespace::new(true, "@irc_".to_owned()),
+            Namespace::new(true, "@other_".to_owned()),
+            Namespace::new(false, "@logger_".to_owned()),
+        ])
+        .unwrap();
+        assert!(ns.is_exclusive_match("@irc_alice:example.org"));
+        assert!(ns.is_exclusive_match("@other_alice:example.org"));
+        assert!(ns.is_match("@logger_alice:example.org"));
+        assert!(!ns.is_exclusive_match("@logger_alice:example.org"));
+        assert!(!ns.is_match("prefix@irc_alice:example.org"));
+        assert!(!ns.is_match("prefix@other_alice:example.org"));
+        assert!(!ns.is_match("prefix@logger_alice:example.org"));
+    }
+
+    #[test]
+    fn namespace_regex_preserves_syntax_error_diagnostics() {
+        for pattern in [
+            ")",
+            "(",
+            "[",
+            "a{2,1}",
+            "(?P<x>a)(?P<x>b)",
+            r"\p{Unknown}",
+            "(?P<1>a)",
+        ] {
+            let original = regex::Regex::new(pattern).unwrap_err();
+            let err = NamespaceRegex::try_from(vec![Namespace::new(true, pattern.to_owned())])
+                .expect_err("invalid namespace syntax must fail");
+            assert!(matches!(err, regex::Error::Syntax(_)));
+            assert_eq!(err.to_string(), original.to_string(), "pattern: {pattern}");
+        }
+    }
+
+    #[test]
+    fn namespace_regex_compile_set_preserves_size_limit_error() {
+        // Exercise the set compiler directly, so an earlier standalone compile
+        // cannot mask an incorrect conversion of its error kind.
+        let pattern = "(?:a{1000}){1000}";
+        let hir = regex_syntax::Parser::new().parse(pattern).unwrap();
+        let err = super::compile_set(vec![hir]).expect_err("oversized HIR must fail");
+        let original = regex::Regex::new(pattern).unwrap_err();
+        match (err, original) {
+            (regex::Error::CompiledTooBig(actual), regex::Error::CompiledTooBig(expected)) => {
+                assert_eq!(actual, expected);
+            }
+            (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
+        }
+        let err = NamespaceRegex::try_from(vec![Namespace::new(true, pattern.to_owned())])
+            .expect_err("oversized namespace must fail");
+        assert!(matches!(err, regex::Error::CompiledTooBig(_)));
     }
 
     #[test]
@@ -489,10 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn anchors_are_text_boundaries_not_line_boundaries() {
-        let ns = users(true, "(?m)@ac_.*");
+    fn start_anchor_is_a_text_boundary_not_a_line_boundary() {
+        let ns = users(true, "(?m)^@ac_.*");
         assert!(ns.is_match("@ac_alice:example.org"));
-        assert!(!ns.is_match("@ac_alice:example.org\n"));
+        assert!(ns.is_match("@ac_alice:example.org\n"));
         assert!(!ns.is_match("x\n@ac_alice:example.org"));
     }
 }
